@@ -1,6 +1,7 @@
 import { DocumentItem, Citation, HealthStatus } from '../types/index.js';
 
-const API_BASE_URL = ''; // Proxied via Vite in dev, same-origin in production
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
+ // Proxied via Vite in dev, same-origin in production
 
 export async function getHealth(): Promise<HealthStatus> {
   const res = await fetch(`${API_BASE_URL}/health`);
