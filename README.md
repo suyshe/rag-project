@@ -57,7 +57,7 @@ If Claude is unavailable → Gemini
 Stream Answer
     ↓
 Show Answer + PDF Sources
-
+```
 ## Tech Stack
 
 ### Frontend
@@ -157,3 +157,4 @@ ai-chatbot-document-rag/
 ├── .gitignore
 ├── package.json
 └── README.md
+```
