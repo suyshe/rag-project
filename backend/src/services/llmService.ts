@@ -14,9 +14,11 @@ function getAnthropicClient(): Anthropic {
 
     anthropicClient = new Anthropic({
       apiKey: env.ANTHROPIC_API_KEY,
-      defaultHeaders: {
-        'anthropic-workspace-id': env.ANTHROPIC_WORKSPACE_ID,
-      },
+      defaultHeaders: env.ANTHROPIC_WORKSPACE_ID
+        ? {
+            'anthropic-workspace-id': env.ANTHROPIC_WORKSPACE_ID,
+          }
+        : undefined,
     });
   }
 
@@ -48,7 +50,8 @@ export function formatRetrievedContext(chunks: RetrievedChunk[]): {
 } {
   if (!chunks || chunks.length === 0) {
     return {
-      contextText: 'No matching document excerpts were found for this query.',
+      contextText:
+        'No matching document excerpts were found for this query.',
       citations: [],
     };
   }
@@ -90,7 +93,7 @@ CRITICAL INSTRUCTIONS:
 4. Style: Provide a concise, well-structured answer formatted with clear Markdown headers, lists, or bold text when appropriate.`;
 
 /**
- * Creates the complete prompt sent to either Claude or Ollama.
+ * Builds the prompt containing the retrieved RAG context.
  */
 function buildUserPrompt(
   userQuery: string,
@@ -106,9 +109,14 @@ ${userQuery}`;
 }
 
 /**
- * Calls Ollama's local chat API and streams the response.
+ * Streams a response from Gemini.
+ *
+ * Gemini is used only when Claude fails.
+ *
+ * The same RAG context and conversation history used by Claude
+ * are passed to Gemini.
  */
-async function streamOllamaResponse(
+async function streamGeminiResponse(
   userQuery: string,
   history: ChatMessage[],
   chunks: RetrievedChunk[],
@@ -116,51 +124,94 @@ async function streamOllamaResponse(
   onFinish: (fullText: string) => void,
   onError: (error: any) => void
 ): Promise<void> {
-  const baseUrl = env.OLLAMA_BASE_URL.replace(/\/$/, '');
-  const model = env.OLLAMA_CHAT_MODEL || 'llama3.2:3b';
+  if (!env.GEMINI_API_KEY) {
+    onError(
+      new Error(
+        'GEMINI_API_KEY is not configured in environment variables.'
+      )
+    );
+    return;
+  }
 
-  const userPromptWithContext = buildUserPrompt(userQuery, chunks);
+  const model = env.GEMINI_MODEL || 'gemini-3.7-flash';
 
-  const messages = [
-    {
-      role: 'system',
-      content: SYSTEM_PROMPT,
-    },
+  const userPromptWithContext = buildUserPrompt(
+    userQuery,
+    chunks
+  );
+
+  /**
+   * Gemini uses a different message structure from Anthropic.
+   *
+   * We preserve the existing last 6 messages.
+   */
+  const contents = [
     ...history.slice(-6).map((msg) => ({
-      role: msg.role,
-      content: msg.content,
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [
+        {
+          text: msg.content,
+        },
+      ],
     })),
+
     {
       role: 'user',
-      content: userPromptWithContext,
+      parts: [
+        {
+          text: userPromptWithContext,
+        },
+      ],
     },
   ];
 
   try {
-    console.log(`[Ollama] Starting fallback with model: ${model}`);
+    console.log(
+      `[Gemini] Starting fallback with model: ${model}`
+    );
 
-    const response = await fetch(`${baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-      }),
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        model
+      )}:streamGenerateContent?alt=sse&key=${encodeURIComponent(
+        env.GEMINI_API_KEY
+      )}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [
+              {
+                text: SYSTEM_PROMPT,
+              },
+            ],
+          },
+
+          contents,
+
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 1500,
+          },
+        }),
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
 
       throw new Error(
-        `Ollama request failed (${response.status}): ${errorText}`
+        `Gemini request failed (${response.status}): ${errorText}`
       );
     }
 
     if (!response.body) {
-      throw new Error('Ollama response did not contain a readable stream.');
+      throw new Error(
+        'Gemini response did not contain a readable stream.'
+      );
     }
 
     const reader = response.body.getReader();
@@ -168,98 +219,107 @@ async function streamOllamaResponse(
 
     let buffer = '';
     let accumulatedText = '';
-    let finished = false;
 
     /**
-     * Process one Ollama JSON line.
+     * Process a single SSE line.
      */
-    const processLine = (line: string): boolean => {
+    const processLine = (line: string): void => {
       const trimmedLine = line.trim();
 
-      if (!trimmedLine) {
-        return false;
+      if (!trimmedLine || trimmedLine.startsWith(':')) {
+        return;
+      }
+
+      if (!trimmedLine.startsWith('data:')) {
+        return;
+      }
+
+      const jsonText = trimmedLine
+        .slice('data:'.length)
+        .trim();
+
+      if (!jsonText) {
+        return;
       }
 
       let data: any;
 
       try {
-        data = JSON.parse(trimmedLine);
+        data = JSON.parse(jsonText);
       } catch {
-        console.warn('[Ollama] Could not parse stream line:', trimmedLine);
-        return false;
+        console.warn(
+          '[Gemini] Could not parse SSE line:',
+          jsonText
+        );
+        return;
       }
 
       if (data.error) {
-        throw new Error(data.error);
+        throw new Error(
+          data.error.message ||
+            JSON.stringify(data.error)
+        );
       }
 
-      const textDelta = data.message?.content || '';
+      const textDelta =
+        data.candidates?.[0]?.content?.parts
+          ?.map((part: any) => part.text || '')
+          .join('') || '';
 
       if (textDelta) {
         accumulatedText += textDelta;
         onTextDelta(textDelta);
       }
-
-      if (data.done === true) {
-        finished = true;
-        return true;
-      }
-
-      return false;
     };
 
-    while (!finished) {
+    while (true) {
       const { value, done } = await reader.read();
 
       if (done) {
         break;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, {
+        stream: true,
+      });
 
       const lines = buffer.split('\n');
 
-      // Keep the incomplete final line in the buffer.
+      // Keep incomplete line.
       buffer = lines.pop() || '';
 
       for (const line of lines) {
         processLine(line);
-
-        if (finished) {
-          break;
-        }
       }
     }
 
-    /**
-     * IMPORTANT:
-     * Process the final buffered JSON line.
-     *
-     * Ollama may close the stream without adding a final newline.
-     */
-    if (!finished && buffer.trim()) {
+    // Process final buffered line.
+    if (buffer.trim()) {
       processLine(buffer);
     }
 
     console.log(
-      `[Ollama] Completed successfully. Generated ${accumulatedText.length} characters.`
+      `[Gemini] Fallback completed successfully. Generated ${accumulatedText.length} characters.`
     );
 
     onFinish(accumulatedText);
   } catch (error: any) {
-    console.error('[Ollama Error]:', error);
+    console.error('[Gemini Error]:', error);
+
     onError(error);
   }
 }
 
 /**
- * Streams response from Claude.
+ * Streams a response from Claude.
  *
- * Claude is the primary provider.
- * If Claude fails, Ollama is automatically used as fallback.
+ * Claude is the PRIMARY provider.
  *
- * Claude output is buffered until Claude successfully finishes so that
- * a partial Claude response is never mixed with an Ollama response.
+ * If Claude fails before completing, Gemini automatically becomes
+ * the fallback provider.
+ *
+ * Claude output is buffered until Claude successfully finishes.
+ * This prevents partial Claude output from being mixed with Gemini.
  */
 export async function streamClaudeResponse(
   userQuery: string,
@@ -269,11 +329,13 @@ export async function streamClaudeResponse(
   onFinish: (fullText: string) => void,
   onError: (error: any) => void
 ): Promise<void> {
-  const userPromptWithContext = buildUserPrompt(userQuery, chunks);
+  const userPromptWithContext = buildUserPrompt(
+    userQuery,
+    chunks
+  );
 
-  const recentHistory: Anthropic.MessageParam[] = history
-    .slice(-6)
-    .map((msg) => ({
+  const recentHistory: Anthropic.MessageParam[] =
+    history.slice(-6).map((msg) => ({
       role: msg.role,
       content: msg.content,
     }));
@@ -287,15 +349,18 @@ export async function streamClaudeResponse(
   ];
 
   const model =
-    env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022';
+    env.ANTHROPIC_MODEL ||
+    'claude-3-5-sonnet-20241022';
 
   let claudeText = '';
   let fallbackStarted = false;
 
   /**
-   * Start Ollama fallback.
+   * Start Gemini fallback.
    */
-  const startOllamaFallback = async (claudeError: any) => {
+  const startGeminiFallback = async (
+    claudeError: any
+  ) => {
     if (fallbackStarted) {
       return;
     }
@@ -303,25 +368,31 @@ export async function streamClaudeResponse(
     fallbackStarted = true;
 
     console.error(
-      '[Claude Failed] Switching to Ollama:',
-      claudeError?.message || claudeError
+      '[Claude Failed] Switching to Gemini:',
+      claudeError?.message ||
+        claudeError
     );
 
-    await streamOllamaResponse(
+    await streamGeminiResponse(
       userQuery,
       history,
       chunks,
       onTextDelta,
       onFinish,
-      (ollamaError) => {
-        console.error('[Ollama Fallback Failed]:', ollamaError);
+      (geminiError) => {
+        console.error(
+          '[Gemini Fallback Failed]:',
+          geminiError
+        );
 
         onError(
           new Error(
-            `Both Claude and Ollama failed. Claude: ${
-              claudeError?.message || 'Unknown Claude error'
-            }. Ollama: ${
-              ollamaError?.message || 'Unknown Ollama error'
+            `Both Claude and Gemini failed. Claude: ${
+              claudeError?.message ||
+              'Unknown Claude error'
+            }. Gemini: ${
+              geminiError?.message ||
+              'Unknown Gemini error'
             }`
           )
         );
@@ -335,12 +406,14 @@ export async function streamClaudeResponse(
     try {
       anthropic = getAnthropicClient();
     } catch (error) {
-      // Claude configuration itself failed.
-      await startOllamaFallback(error);
+      // Claude configuration failed.
+      await startGeminiFallback(error);
       return;
     }
 
-    console.log(`[Claude] Starting request with model: ${model}`);
+    console.log(
+      `[Claude] Starting request with model: ${model}`
+    );
 
     const stream = anthropic.messages.stream({
       model,
@@ -350,9 +423,13 @@ export async function streamClaudeResponse(
     });
 
     stream.on('text', (textDelta) => {
-      // IMPORTANT:
-      // Do not immediately send Claude chunks to frontend.
-      // Buffer them so fallback can safely replace a failed Claude request.
+      /**
+       * IMPORTANT:
+       * Buffer Claude output.
+       *
+       * If Claude fails, we don't want the frontend to receive
+       * half of a Claude answer followed by a Gemini answer.
+       */
       claudeText += textDelta;
     });
 
@@ -361,9 +438,15 @@ export async function streamClaudeResponse(
         return;
       }
 
-      console.log('[Claude] Request completed successfully.');
+      console.log(
+        '[Claude] Request completed successfully.'
+      );
 
-      // Claude succeeded, so now send the buffered answer to frontend.
+      /**
+       * Claude succeeded.
+       *
+       * Send the buffered answer to the frontend now.
+       */
       if (claudeText) {
         onTextDelta(claudeText);
       }
@@ -376,9 +459,9 @@ export async function streamClaudeResponse(
         return;
       }
 
-      await startOllamaFallback(err);
+      await startGeminiFallback(err);
     });
   } catch (err: any) {
-    await startOllamaFallback(err);
+    await startGeminiFallback(err);
   }
 }

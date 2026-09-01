@@ -35,7 +35,7 @@ export async function runMigrations(): Promise<void> {
         content TEXT NOT NULL,
         page_number INTEGER NOT NULL,
         token_count INTEGER NOT NULL,
-        embedding vector(768),
+        embedding vector(1536),
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);

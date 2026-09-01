@@ -52,6 +52,12 @@ export async function processAndStorePdf(
     // 3. Generate OpenAI embeddings for all chunks in batch
     const chunkTexts = chunks.map((c) => c.content);
     const embeddings = await generateBatchEmbeddings(chunkTexts, 50);
+    
+    if (embeddings.length !== chunks.length) {
+      throw new Error(
+        `Embedding count mismatch: expected ${chunks.length}, received ${embeddings.length}`
+      );
+    }
 
     // 4. Save chunks and embeddings into PostgreSQL
     for (let i = 0; i < chunks.length; i++) {

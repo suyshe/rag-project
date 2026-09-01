@@ -1,65 +1,163 @@
+// src/services/embeddingService.ts
+
+import { CohereClientV2 } from 'cohere-ai';
 import { env } from '../config/env.js';
 
-const OLLAMA_BASE_URL =
-  env.OLLAMA_BASE_URL || 'http://localhost:11434';
+let cohereClient: CohereClientV2 | null = null;
 
-const OLLAMA_EMBEDDING_MODEL =
-  env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text';
-
-async function generateEmbedding(text: string): Promise<number[]> {
-  const response = await fetch(
-    `${OLLAMA_BASE_URL}/api/embeddings`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: OLLAMA_EMBEDDING_MODEL,
-        prompt: text.replace(/\n+/g, ' '),
-      }),
+function getCohereClient(): CohereClientV2 {
+  if (!cohereClient) {
+    if (!env.COHERE_API_KEY) {
+      throw new Error(
+        'COHERE_API_KEY is not configured in environment variables.'
+      );
     }
-  );
 
-  if (!response.ok) {
-    const errorText = await response.text();
+    cohereClient = new CohereClientV2({
+      token: env.COHERE_API_KEY,
+    });
+  }
 
+  return cohereClient;
+}
+
+const EMBEDDING_MODEL =
+  env.COHERE_EMBEDDING_MODEL || 'embed-v4.0';
+
+const EMBEDDING_DIMENSION = 1536;
+
+/**
+ * Generate an embedding for a user query.
+ *
+ * Uses search_query because this vector will be compared
+ * against document embeddings in pgvector.
+ */
+export async function generateQueryEmbedding(
+  text: string
+): Promise<number[]> {
+  if (!text || !text.trim()) {
     throw new Error(
-      `Ollama embedding failed: ${response.status} ${errorText}`
+      'Cannot generate embedding for empty text.'
     );
   }
 
-  const data = (await response.json()) as {
-    embedding?: number[];
-  };
+  const cohere = getCohereClient();
 
-  if (!data.embedding) {
-    throw new Error('Ollama did not return an embedding.');
+  const response = await cohere.embed({
+    model: EMBEDDING_MODEL,
+
+    inputType: 'search_query',
+
+    embeddingTypes: ['float'],
+
+    outputDimension: EMBEDDING_DIMENSION,
+
+    texts: [text.trim()],
+  });
+
+  const embedding = response.embeddings?.float?.[0];
+
+  if (!embedding) {
+    throw new Error(
+      'Cohere returned no query embedding.'
+    );
   }
 
-  return data.embedding;
+  if (embedding.length !== EMBEDDING_DIMENSION) {
+    throw new Error(
+      `Unexpected embedding dimension. Expected ${EMBEDDING_DIMENSION}, received ${embedding.length}.`
+    );
+  }
+
+  return embedding;
 }
 
-export async function generateQueryEmbedding(
-  queryText: string
-): Promise<number[]> {
-  return generateEmbedding(queryText);
-}
-
+/**
+ * Generate embeddings for document chunks.
+ *
+ * Uses search_document because these vectors are stored
+ * in the vector database for retrieval.
+ */
 export async function generateBatchEmbeddings(
   texts: string[],
   batchSize = 50
 ): Promise<number[][]> {
+  if (!texts.length) {
+    return [];
+  }
+
+  const cleanedTexts = texts
+    .map((text) => text.trim())
+    .filter(Boolean);
+
+  if (!cleanedTexts.length) {
+    return [];
+  }
+
+  const cohere = getCohereClient();
+
   const allEmbeddings: number[][] = [];
 
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize);
-
-    const embeddings = await Promise.all(
-      batch.map((text) => generateEmbedding(text))
+  for (
+    let i = 0;
+    i < cleanedTexts.length;
+    i += batchSize
+  ) {
+    const batch = cleanedTexts.slice(
+      i,
+      i + batchSize
     );
 
-    allEmbeddings.push(...embeddings);
+    console.log(
+      `[Embeddings] Generating Cohere embeddings ${i + 1}-${Math.min(
+        i + batch.length,
+        cleanedTexts.length
+      )} of ${cleanedTexts.length}`
+    );
+
+    const response = await cohere.embed({
+      model: EMBEDDING_MODEL,
+
+      inputType: 'search_document',
+
+      embeddingTypes: ['float'],
+
+      outputDimension: EMBEDDING_DIMENSION,
+
+      texts: batch,
+    });
+
+    const batchEmbeddings =
+      response.embeddings?.float;
+
+    if (
+      !batchEmbeddings ||
+      batchEmbeddings.length !== batch.length
+    ) {
+      throw new Error(
+        `Cohere embedding count mismatch. Expected ${batch.length}, received ${
+          batchEmbeddings?.length || 0
+        }.`
+      );
+    }
+
+    for (const embedding of batchEmbeddings) {
+      if (embedding.length !== EMBEDDING_DIMENSION) {
+        throw new Error(
+          `Unexpected embedding dimension. Expected ${EMBEDDING_DIMENSION}, received ${embedding.length}.`
+        );
+      }
+
+      allEmbeddings.push(embedding);
+    }
+  }
+
+  if (
+    allEmbeddings.length !== cleanedTexts.length
+  ) {
+    throw new Error(
+      `Total embedding count mismatch. Expected ${cleanedTexts.length}, received ${allEmbeddings.length}.`
+    );
   }
 
   return allEmbeddings;

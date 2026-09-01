@@ -1,4 +1,4 @@
-import pdfParse from 'pdf-parse';
+import { PDFParse } from 'pdf-parse';
 
 export interface PageText {
   pageNumber: number;
@@ -12,64 +12,57 @@ export interface ParsedPdfResult {
 }
 
 /**
- * Extracts clean text and per-page mappings from a PDF buffer using pdf-parse.
+ * Extracts text and page-level mappings from a PDF buffer.
+ *
+ * Uses the current pdf-parse API.
  */
-export async function extractPdfText(buffer: Buffer): Promise<ParsedPdfResult> {
-  const pages: PageText[] = [];
-  let pageCounter = 0;
-
-  const customPagerender = (pageData: any) => {
-    return pageData.getTextContent({
-      normalizeWhitespace: true,
-      disableCombineTextItems: false,
-    }).then((textContent: any) => {
-      pageCounter++;
-      let lastY: number | null = null;
-      let pageText = '';
-
-      for (const item of textContent.items) {
-        if (lastY === item.transform[5] || lastY === null) {
-          pageText += (item.str || '') + ' ';
-        } else {
-          pageText += '\n' + (item.str || '') + ' ';
-        }
-        lastY = item.transform[5];
-      }
-
-      const cleanedText = pageText
-        .replace(/[ \t]+/g, ' ')
-        .replace(/\n\s*\n/g, '\n\n')
-        .trim();
-
-      pages.push({
-        pageNumber: pageCounter,
-        text: cleanedText,
-      });
-
-      return pageText;
-    });
-  };
-
+export async function extractPdfText(
+  buffer: Buffer
+): Promise<ParsedPdfResult> {
   try {
-    const data = await pdfParse(buffer, {
-      pagerender: customPagerender,
+    const parser = new PDFParse({
+      data: buffer,
     });
 
-    // If pages array wasn't populated properly by the custom renderer, fallback to full text
-    if (pages.length === 0) {
-      const full = (data.text || '').trim();
+    const result = await parser.getText();
+
+    const fullText = (result.text || '').trim();
+
+    /**
+     * pdf-parse returns page-separated text.
+     * We split it into individual pages while preserving
+     * page numbers for RAG citations.
+     */
+    const rawPages = fullText
+      .split(/\f/)
+      .map((text) => text.trim());
+
+    const pages: PageText[] = rawPages
+      .map((text, index) => ({
+        pageNumber: index + 1,
+        text,
+      }))
+      .filter((page) => page.text.length > 0);
+
+    /**
+     * Some PDFs may not contain form-feed page separators.
+     * In that case, keep the complete text as page 1.
+     */
+    if (pages.length === 0 && fullText) {
       pages.push({
         pageNumber: 1,
-        text: full,
+        text: fullText,
       });
     }
 
     return {
-      totalPages: data.numpages || pages.length || 1,
-      fullText: data.text || '',
-      pages: pages.sort((a, b) => a.pageNumber - b.pageNumber),
+      totalPages: result.total || pages.length || 1,
+      fullText,
+      pages,
     };
   } catch (error: any) {
-    throw new Error(`Failed to parse PDF: ${error.message || error}`);
+    throw new Error(
+      `Failed to parse PDF: ${error?.message || error}`
+    );
   }
 }

@@ -86,26 +86,23 @@ export const MessageItem: React.FC<MessageItemProps> = ({ message, onSelectCitat
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between gap-2 mb-1">
           <span className="text-xs font-semibold text-slate-300">
-            {isUser ? 'You' : 'Assistant (Claude RAG)'}
+            {isUser ? 'You' : 'Assistant'}
           </span>
           <span className="text-[10px] text-slate-500">{message.timestamp}</span>
         </div>
 
         {/* Content */}
         <div className="prose text-sm text-slate-200">
-          {message.content ? (
-            renderMessageContent(message.content)
-          ) : message.isStreaming ? (
+          {message.isStreaming ? (
             <div className="flex items-center gap-1.5 py-1 text-slate-400 text-xs">
-              <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
-              <span>Retrieving top-5 chunks & thinking...</span>
+              <span className="inline-block w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+              <span>Thinking...</span>
             </div>
-          ) : null}
-
-          {message.isStreaming && message.content && (
-            <span className="inline-block w-1.5 h-4 ml-1 bg-indigo-400 animate-pulse align-middle" />
-          )}
+          ) : message.content ? (
+            renderMessageContent(message.content)
+         ) : null}
         </div>
+
 
         {/* Error notification */}
         {message.error && (
